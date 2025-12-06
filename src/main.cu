@@ -1,12 +1,20 @@
 #include <iostream>
 #include <vector>
-#include <multigrid.cuh>
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
+#include <MSBG.cuh>
 #include <vtx_visualization.cuh>
 
 __global__ void countActiveBlocks(const uint32_t* map, uint32_t* out, uint32_t N) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     if (map[i] <= (MAX_LEVELS - 1)) atomicAdd(out, 1);
+}
+
+__global__ void initArrayConst(float* data, float value, uint32_t N) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    data[idx] = value;
 }
 
 int main() {
@@ -14,7 +22,7 @@ int main() {
 
     int device;
     cudaGetDevice(&device);
-    cudaDeviceProp prop;
+    cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, device);
     std::cout << "CUDA device " << prop.name << std::endl;
     std::cout << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
@@ -24,7 +32,7 @@ int main() {
     float blockSize = 1.0f;
     float3 domainMin = make_float3(0, 0, 0);
 
-    MultigridManager mg(dims, blockSize, domainMin);
+    MSBGManager mg(dims, blockSize, domainMin);
 
     // Generate random particles
     const uint32_t numParticles = 50000;
@@ -167,6 +175,75 @@ int main() {
     std::cout << "Total faceX count: " << mg.grid.totalFacesX << "\n";
     std::cout << "Total faceY count: " << mg.grid.totalFacesY << "\n";
     std::cout << "Total faceZ count: " << mg.grid.totalFacesZ << "\n";
+
+    thrust::device_ptr<uint32_t> dev_c_counts(d_cellCounts);
+    thrust::device_ptr<uint32_t> dev_fx_counts(d_fxCounts);
+    thrust::device_ptr<uint32_t> dev_fy_counts(d_fyCounts);
+    thrust::device_ptr<uint32_t> dev_fz_counts(d_fzCounts);
+
+    thrust::device_ptr<uint32_t> dev_c_offsets(mg.grid.d_cellOffsets);
+    thrust::device_ptr<uint32_t> dev_fx_offsets(mg.grid.d_faceXOffsets);
+    thrust::device_ptr<uint32_t> dev_fy_offsets(mg.grid.d_faceYOffsets);
+    thrust::device_ptr<uint32_t> dev_fz_offsets(mg.grid.d_faceZOffsets);
+
+    thrust::exclusive_scan(dev_c_counts, dev_c_counts + mg.grid.numBlocks, dev_c_offsets);
+    thrust::exclusive_scan(dev_fx_counts, dev_fx_counts + mg.grid.numBlocks, dev_fx_offsets);
+    thrust::exclusive_scan(dev_fy_counts, dev_fy_counts + mg.grid.numBlocks, dev_fy_offsets);
+    thrust::exclusive_scan(dev_fz_counts, dev_fz_counts + mg.grid.numBlocks, dev_fz_offsets);
+
+    cudaDeviceSynchronize();
+
+    std::cout << "Allocating Data Channels...\n";
+    mg.allocateChannels();
+
+    float* h_faceXPtrs[NUM_CHANNELS];
+    float* h_faceYPtrs[NUM_CHANNELS];
+    float* h_faceZPtrs[NUM_CHANNELS];
+
+    cudaMemcpy(h_faceXPtrs, mg.grid.d_faceXData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_faceYPtrs, mg.grid.d_faceYData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_faceZPtrs, mg.grid.d_faceZData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+
+    float* d_fineBetaX = h_faceXPtrs[BETA_COEFF_X];
+    float* d_fineBetaY = h_faceYPtrs[BETA_COEFF_Y];
+    float* d_fineBetaZ = h_faceZPtrs[BETA_COEFF_Z];
+
+    int numThreads = 256;
+    int numBlocksInitX = (mg.grid.totalFacesX + numThreads - 1) / numThreads;
+    int numBlocksInitY = (mg.grid.totalFacesY + numThreads - 1) / numThreads;
+    int numBlocksInitZ = (mg.grid.totalFacesZ + numThreads - 1) / numThreads;
+
+    initArrayConst<<<numBlocksInitX, numThreads>>>(d_fineBetaX, 1.f, mg.grid.totalFacesX);
+    initArrayConst<<<numBlocksInitY, numThreads>>>(d_fineBetaY, 1.f, mg.grid.totalFacesY);
+    initArrayConst<<<numBlocksInitZ, numThreads>>>(d_fineBetaZ, 1.f, mg.grid.totalFacesZ);
+    cudaDeviceSynchronize();
+
+    std::cout << "Running Galerkin Coarsening Test (Level 0 -> 1)...\n";
+
+    mg.runGalerkin(d_fineBetaX, d_fineBetaY, d_fineBetaZ,
+        d_fineBetaX, d_fineBetaY, d_fineBetaZ, 1);
+
+    std::vector<float> h_betaX(mg.grid.totalFacesX);
+    cudaMemcpy(h_betaX.data(), d_fineBetaX, mg.grid.totalFacesX * sizeof(float), cudaMemcpyDeviceToHost);
+
+    std::vector<uint32_t> h_faceXOffsets(mg.grid.numBlocks);
+    cudaMemcpy(h_faceXOffsets.data(), mg.grid.d_faceXOffsets, mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    int testCount = 0;
+
+    std::cout << "Verifying results...\n";
+
+    for (uint32_t i = 0; i < mg.grid.numBlocks; i++) {
+        if (h_refinementMap[i] == 0) {
+            uint32_t offset = h_faceXOffsets[i];
+            float val = h_betaX[offset];
+
+            std::cout << "Block " << i << " lvl 0: " << val << "\n";
+
+            testCount++;
+        }
+    }
+
     std::cout << std::endl;
 
     cudaFree(d_cellCounts);
