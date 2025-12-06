@@ -5,6 +5,10 @@
 #define MAX_LEVELS 3
 #define WARP_SIZE 32
 
+#define DELTA_G 0.75f
+#define SIGMA_CF (1 / (4 * DELTA_G))
+#define SIGMA_FC (2 * SIGMA_CF)
+
 enum DataChannel {
     // Velocity components (MAC grid - face-centered)
     VELOCITY_X = 0,
@@ -45,6 +49,8 @@ enum DataChannel {
     NUM_CHANNELS = 20
 };
 
+enum Axis { AXIS_X = 0, AXIS_Y = 1, AXIS_Z = 2 };
+
 struct BlockInfo {
     int3 coord;
     uint32_t level;
@@ -62,7 +68,7 @@ struct BlockLayout {
 
 __constant__ inline BlockLayout c_blockLayouts[MAX_LEVELS];
 
-struct Multigrid {
+struct MSBG {
     // Block topology
     int3 indexDims;
     uint32_t numBlocks;
@@ -167,10 +173,22 @@ __device__ inline uint32_t faceZIndex3D(int x, int y, int z, int res) {
     return x + res * (y + res * z);
 }
 
+__device__ inline uint32_t getNeighborBlockIdx(int3 blockCoord, int3 dims, int dx, int dy, int dz) {
+    int3 nCoord = make_int3(blockCoord.x + dx, blockCoord.y + dy, blockCoord.z + dz);
+
+    if (nCoord.x < 0 || nCoord.x >= dims.x ||
+        nCoord.y < 0 || nCoord.y >= dims.y ||
+        nCoord.z < 0 || nCoord.z >= dims.z) {
+        return -1;
+        }
+
+    return blockCoordToIndex(nCoord, dims);
+}
+
 //// Grid access
 
 __device__ inline float& accessCell(
-    Multigrid& grid,
+    MSBG& grid,
     DataChannel channel,
     uint32_t blockId,
     int x, int y, int z,
@@ -183,7 +201,7 @@ __device__ inline float& accessCell(
 }
 
 __device__ inline float& accessFaceX(
-    Multigrid& grid,
+    MSBG& grid,
     DataChannel channel,
     uint32_t blockId,
     int x, int y, int z,
@@ -196,7 +214,7 @@ __device__ inline float& accessFaceX(
 }
 
 __device__ inline float& accessFaceY(
-    Multigrid& grid,
+    MSBG& grid,
     DataChannel channel,
     uint32_t blockId,
     int x, int y, int z,
@@ -209,7 +227,7 @@ __device__ inline float& accessFaceY(
 }
 
 __device__ inline float& accessFaceZ(
-    Multigrid& grid,
+    MSBG& grid,
     DataChannel channel,
     uint32_t blockId,
     int x, int y, int z,
@@ -223,6 +241,20 @@ __device__ inline float& accessFaceZ(
 
 //// Block management
 
+__global__ void initBlockInfo(BlockInfo* info, int3 dims) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t numBlocks = dims.x * dims.y * dims.z;
+    if (idx >= numBlocks) return;
+
+    int z = idx / (dims.x * dims.y);
+    int rem = idx % (dims.x * dims.y);
+    int y = rem / dims.x;
+    int x = rem % dims.x;
+
+    info[idx].coord = make_int3(x, y, z);
+    info[idx].morton = morton3D(x, y, z);
+    info[idx].level = 0;
+}
 // Mark active blocks from particle positions
 __global__ void markActiveBlocks(
     const float3* particles,
@@ -333,13 +365,128 @@ __global__ void countBlockElements(
     }
 }
 
+__device__ inline float getScalingFactor(uint32_t currentLevel, uint32_t neighborBlockIdx, const uint32_t* refinementMap) {
+    uint32_t neighborLevel = (neighborBlockIdx != -1) ? refinementMap[neighborBlockIdx] : currentLevel;
+    int levelDiff = currentLevel - neighborLevel;
+
+
+    // case 0: s <- 2^l
+    // case 1: s <- 2^l * sigma_CF
+    // case -1: s <- 2^l * sigma_FC
+
+    float s = (float)(1 << currentLevel);
+
+    switch (levelDiff) {
+        case 0: break;
+        case 1: s *= SIGMA_CF; break;
+        case -1: s *= SIGMA_FC; break;
+        default: break;
+    }
+
+    return s;
+}
+
+__global__ void galerkinCoarsen(MSBG grid, const float* d_fineCoeffs, float* d_coarseCoeffs, int axis, uint32_t coarseLevel) {
+    uint32_t idx = blockIdx.x;
+    if (idx >= grid.numBlocks) return;
+
+    uint32_t nativeLevel = grid.d_refinementMap[idx];
+
+    if (nativeLevel != (coarseLevel - 1)) return;
+
+    BlockLayout coarseLayout = c_blockLayouts[coarseLevel];
+    int coarseRes = coarseLayout.res;
+
+    BlockLayout fineLayout = c_blockLayouts[coarseLevel - 1];
+    int fineRes = fineLayout.res;
+
+    // One thread per face within block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tz = threadIdx.z;
+
+    int dimX = coarseRes + (axis == AXIS_X ? 1 : 0);
+    int dimY = coarseRes + (axis == AXIS_Y ? 1 : 0);
+    int dimZ = coarseRes + (axis == AXIS_Z ? 1 : 0);
+
+    if (tx >= dimX || ty >= dimY || tz >= dimZ) return;
+
+    uint32_t neighborIdx = -1;
+    bool isBoundary = false;
+    int3 bCoord = grid.d_blockInfo[idx].coord;
+
+    if (axis == AXIS_X) {
+        if (tx == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, -1, 0, 0); isBoundary = true; }
+        if (tx == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 1, 0, 0); isBoundary = true; }
+    } else if (axis == AXIS_Y) {
+        if (ty == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, -1, 0); isBoundary = true; }
+        if (ty == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 1, 0); isBoundary = true; }
+    } else {
+        if (tz == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 0, -1); isBoundary = true; }
+        if (tz == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 0, -1); isBoundary = true; }
+    }
+
+    float s;
+    if (isBoundary) {
+        s = getScalingFactor(coarseLevel, neighborIdx, grid.d_refinementMap);
+    } else {
+        s = (float)(1 << coarseLevel);
+    }
+
+    float sum = 0.f;
+    uint32_t fineBlockOffset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
+                             : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
+                             :                    grid.d_faceZOffsets[idx];
+
+    const int fx_start = tx * 2;
+    const int fy_start = ty * 2;
+    const int fz_start = tz * 2;
+
+    for (int d1 = 0; d1 < 2; d1++) {
+        for (int d2 = 0; d2 < 2; d2++) {
+            int f_x = fx_start;
+            int f_y = fy_start;
+            int f_z = fz_start;
+
+            if (axis == AXIS_X) {
+                f_y += d1;
+                f_z += d2;
+            } else if (axis == AXIS_Y) {
+                f_x += d1;
+                f_z += d2;
+            } else {
+                f_x += d1;
+                f_y += d2;
+            }
+
+            uint32_t fineIdx;
+            if (axis == AXIS_X) fineIdx = faceXIndex3D(f_x, f_y, f_z, fineRes);
+            else if (axis == AXIS_Y) fineIdx = faceYIndex3D(f_x, f_y, f_z, fineRes);
+            else fineIdx = faceZIndex3D(f_x, f_y, f_z, fineRes);
+
+            sum += d_fineCoeffs[fineBlockOffset + fineIdx];
+        }
+    }
+
+    uint32_t coarseBlockOffset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
+                                : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
+                                : grid.d_faceZOffsets[idx];
+
+    uint32_t coarseIdx;
+    if (axis == AXIS_X) coarseIdx = faceXIndex3D(tx, ty, tz, coarseRes);
+    else if (axis == AXIS_Y) coarseIdx = faceYIndex3D(tx, ty, tz, coarseRes);
+    else coarseIdx = faceZIndex3D(tx, ty, tz, coarseRes);
+
+    d_coarseCoeffs[coarseBlockOffset + coarseIdx] = s * (sum * 0.25f);
+}
+
 //// Grid Manager class
 
-class MultigridManager {
+class MSBGManager {
 public:
-    Multigrid grid;
+    MSBG grid;
 
-    MultigridManager(int3 dims, float blockSize, float3 domainMin) {
+    MSBGManager(int3 dims, float blockSize, float3 domainMin) {
         grid.indexDims = dims;
         grid.blockSize = blockSize;
         grid.domainMin = domainMin;
@@ -349,13 +496,28 @@ public:
         cudaMalloc(&grid.d_refinementMap, grid.numBlocks * sizeof(uint32_t));
         cudaMemset(grid.d_refinementMap, MAX_LEVELS - 1, grid.numBlocks * sizeof(uint32_t));
 
+        cudaMalloc(&grid.d_blockInfo, grid.numBlocks * sizeof(BlockInfo));
+
+        int threads = 256;
+        int blocks = (grid.numBlocks + threads - 1) / threads;
+        initBlockInfo<<<blocks, threads>>>(grid.d_blockInfo, dims);
+        cudaDeviceSynchronize();
+
+        cudaMalloc(&grid.d_cellOffsets, grid.numBlocks * sizeof(uint32_t));
+
+        cudaMalloc(&grid.d_cellOffsets, grid.numBlocks * sizeof(uint32_t));
+        cudaMalloc(&grid.d_faceXOffsets, grid.numBlocks * sizeof(uint32_t));
+        cudaMalloc(&grid.d_faceYOffsets, grid.numBlocks * sizeof(uint32_t));
+        cudaMalloc(&grid.d_faceZOffsets, grid.numBlocks * sizeof(uint32_t));
+
+        // Initialize to 0
+        cudaMemset(grid.d_cellOffsets, 0, grid.numBlocks * sizeof(uint32_t));
+        cudaMemset(grid.d_faceXOffsets, 0, grid.numBlocks * sizeof(uint32_t));
+        cudaMemset(grid.d_faceYOffsets, 0, grid.numBlocks * sizeof(uint32_t));
+        cudaMemset(grid.d_faceZOffsets, 0, grid.numBlocks * sizeof(uint32_t));
+
         // Init block layouts in constant GPU mem
         initializeBlockLayouts();
-
-        grid.d_cellOffsets = nullptr;
-        grid.d_faceXOffsets = nullptr;
-        grid.d_faceYOffsets = nullptr;
-        grid.d_faceZOffsets = nullptr;
         grid.d_cellData = nullptr;
         grid.d_faceXData = nullptr;
         grid.d_faceYData = nullptr;
@@ -364,7 +526,7 @@ public:
         grid.numActiveBlocks = 0;
     }
 
-    ~MultigridManager() {
+    ~MSBGManager() {
         cleanup();
     }
 
@@ -376,41 +538,48 @@ public:
         if (grid.d_faceYOffsets) cudaFree(grid.d_faceYOffsets);
         if (grid.d_faceZOffsets) cudaFree(grid.d_faceZOffsets);
 
+        float* h_temp[NUM_CHANNELS];
+
         // free data channels
         if (grid.d_cellData) {
+            cudaMemcpy(h_temp, grid.d_cellData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
             for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (grid.d_cellData[i]) cudaFree(grid.d_cellData[i]);
+                if (h_temp[i]) cudaFree(h_temp[i]);
             }
             cudaFree(grid.d_cellData);
+            grid.d_cellData = nullptr;
         }
 
         if (grid.d_faceXData) {
+            cudaMemcpy(h_temp, grid.d_faceXData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
             for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (grid.d_faceXData[i]) cudaFree(grid.d_faceXData[i]);
+                if (h_temp[i]) cudaFree(h_temp[i]);
             }
             cudaFree(grid.d_faceXData);
         }
 
         if (grid.d_faceYData) {
+            cudaMemcpy(h_temp, grid.d_faceYData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
             for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (grid.d_faceYData[i]) cudaFree(grid.d_faceYData[i]);
+                if (h_temp[i]) cudaFree(h_temp[i]);
             }
             cudaFree(grid.d_faceYData);
         }
 
         if (grid.d_faceZData) {
+            cudaMemcpy(h_temp, grid.d_faceZData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
             for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (grid.d_faceZData[i]) cudaFree(grid.d_faceZData[i]);
+                if (h_temp[i]) cudaFree(h_temp[i]);
             }
             cudaFree(grid.d_faceZData);
         }
     }
 
     void allocateChannels() {
-        float** h_cellData = new float*[NUM_CHANNELS];
-        float** h_faceXData = new float*[NUM_CHANNELS];
-        float** h_faceYData = new float*[NUM_CHANNELS];
-        float** h_faceZData = new float*[NUM_CHANNELS];
+        auto** h_cellData = new float*[NUM_CHANNELS];
+        auto** h_faceXData = new float*[NUM_CHANNELS];
+        auto** h_faceYData = new float*[NUM_CHANNELS];
+        auto** h_faceZData = new float*[NUM_CHANNELS];
 
         memset(h_cellData, 0, NUM_CHANNELS * sizeof(float*));
         memset(h_faceXData, 0, NUM_CHANNELS * sizeof(float*));
@@ -466,6 +635,22 @@ public:
         delete[] h_faceXData;
         delete[] h_faceYData;
         delete[] h_faceZData;
+    }
+
+    void runGalerkin(float* d_fineBetaX, float* d_fineBetaY, float* d_fineBetaZ,
+                     float* d_coarseBetaX, float* d_coarseBetaY, float* d_coarseBetaZ,
+                     uint32_t targetCoarseLevel) {
+        if (targetCoarseLevel == 0 || targetCoarseLevel >= MAX_LEVELS) return;
+
+        int dim = c_blockLayouts[targetCoarseLevel].res + 1;
+        dim3 threads(dim, dim, dim);
+        dim3 blocks(this->grid.numBlocks);
+
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaX, d_coarseBetaX, AXIS_X, targetCoarseLevel);
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaY, d_coarseBetaY, AXIS_Y, targetCoarseLevel);
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaZ, d_coarseBetaZ, AXIS_Z, targetCoarseLevel);
+
+        cudaDeviceSynchronize();
     }
 };
 #endif //ANITOWAVE_ADAPTIVE_MULTIGRID_CUH
