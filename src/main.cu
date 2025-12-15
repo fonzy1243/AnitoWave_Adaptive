@@ -3,6 +3,7 @@
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
 #include <MSBG.cuh>
+#include <P2G.cuh>
 #include <Smoother.cuh>
 #include <VCycle.cuh>
 #include <vtx_visualization.cuh>
@@ -12,6 +13,58 @@ struct SquareOp {
         return x * x;
     }
 };
+
+__global__ void test_rasterizeParticlesToRHS(
+    MSBG grid,
+    const float3* particles,
+    uint32_t numParticles,
+    DataChannel targetChannel
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numParticles) return;
+
+    float3 pos = particles[idx];
+
+    // 1. Find Block
+    int3 bCoord = worldToBlockCoord(pos, grid.blockSize, grid.domainMin);
+
+    // Bounds check
+    if (bCoord.x < 0 || bCoord.x >= grid.indexDims.x ||
+        bCoord.y < 0 || bCoord.y >= grid.indexDims.y ||
+        bCoord.z < 0 || bCoord.z >= grid.indexDims.z) return;
+
+    uint32_t blockIdx = blockCoordToIndex(bCoord, grid.indexDims);
+    uint32_t level = grid.d_refinementMap[blockIdx];
+
+    // Ignore inactive blocks
+    if (level >= MAX_LEVELS) return;
+
+    // 2. Find Cell inside Block
+    float3 blockOrigin;
+    blockOrigin.x = bCoord.x * grid.blockSize;
+    blockOrigin.y = bCoord.y * grid.blockSize;
+    blockOrigin.z = bCoord.z * grid.blockSize;
+
+    float3 localPos = make_float3(pos.x - blockOrigin.x, pos.y - blockOrigin.y, pos.z - blockOrigin.z);
+
+    int res = c_blockLayouts[level].res;
+    float cellSize = grid.blockSize / (float)res;
+
+    int cx = (int)(localPos.x / cellSize);
+    int cy = (int)(localPos.y / cellSize);
+    int cz = (int)(localPos.z / cellSize);
+
+    // Clamp
+    cx = max(0, min(cx, res - 1));
+    cy = max(0, min(cy, res - 1));
+    cz = max(0, min(cz, res - 1));
+
+    // 3. Splat Mass (Atomic Add)
+    // We add a simplified mass of 1.0 per particle.
+    // This creates a density field where particles are clustered.
+    uint32_t offset = grid.d_cellOffsets[blockIdx];
+    atomicAdd(&grid.d_cellData[targetChannel][offset + cellIndex3D(cx, cy, cz, res)], 1.0f);
+}
 
 __global__ void countActiveBlocks(const uint32_t* map, uint32_t* out, uint32_t N) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -43,7 +96,7 @@ int main() {
     std::cout << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
 
     // Setup multigrid
-    int3 dims = make_int3(40, 40, 40);
+    int3 dims = make_int3(60, 60, 60);
     float blockSize = 1.0f;
     float3 domainMin = make_float3(0, 0, 0);
 
@@ -89,9 +142,12 @@ int main() {
     }
 
     float3* d_pos;
+    float3* d_vel;
     float* d_rad;
     cudaMalloc(&d_pos, numParticles * sizeof(float3));
     cudaMalloc(&d_rad, numParticles * sizeof(float));
+    cudaMalloc(&d_vel, numParticles * sizeof(float3));
+    cudaMemset(d_vel, 0, numParticles * sizeof(float3));
     cudaMemcpy(d_pos, h_pos.data(), numParticles * sizeof(float3), cudaMemcpyHostToDevice);
     cudaMemcpy(d_rad, h_rad.data(), numParticles * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -242,8 +298,11 @@ int main() {
     float* h_cellPtrs[NUM_CHANNELS];
     cudaMemcpy(h_cellPtrs, mg.grid.d_cellData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
     initArrayConst<<<(mg.grid.totalCells + 255)/256, 256>>>(h_cellPtrs[PRESSURE], 0.f, mg.grid.totalCells);
-    initDivergence<<<(mg.grid.totalCells + 255)/256, 256>>>(h_cellPtrs[DIVERGENCE], mg.grid.totalCells);
+    initArrayConst<<<(mg.grid.totalCells + 255)/256, 256>>>(h_cellPtrs[DIVERGENCE], 0.f, mg.grid.totalCells);
     cudaDeviceSynchronize();
+
+    P2GTransfer p2g;
+    p2g.run(mg, d_pos, d_vel, numParticles);
 
     // 2. Setup V-Cycle
     std::cout << "Building V-Cycle Hierarchy..." << std::endl;
@@ -253,6 +312,7 @@ int main() {
     // 3. Run
     std::cout << "Running 10 V-Cycles..." << std::endl;
     for(int i = 0; i < 10; i++) {
+        std::cout << "Iteration " << i << std::endl;
         solver.runCycle(mg, 0);
     }
     cudaDeviceSynchronize();
@@ -262,63 +322,6 @@ int main() {
     float max_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, -1e20f, thrust::maximum<float>());
     float min_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, 1e20f, thrust::minimum<float>());
     std::cout << "Pressure Range: [" << min_p << ", " << max_p << "]" << std::endl;
-
-    // ---------------------------------------------------------
-    // 3. Run Solver Loop with Residual Tracking
-    // ---------------------------------------------------------
-
-    // Temporary buffer for computing residuals on Level 0
-    float* d_r0;
-    cudaMalloc(&d_r0, mg.grid.totalCells * sizeof(float));
-
-    std::cout << "\nStarting V-Cycles (Target: Reduce Residual)...\n";
-    std::cout << "Cycle | Residual (L2 Norm)\n";
-    std::cout << "--------------------------\n";
-
-    // Initial Residual (Before solving, x=0, so r = b - A*0 = b)
-    // We strictly assume r=b, but let's compute it properly to be safe.
-    // Note: computeExplicitResidual is inside VCycle.cuh, but it's a __global__ kernel.
-    // We need to launch it manually here or expose a helper in VCycleSolver.
-    // For now, we will launch it using the pointers solver has cached.
-
-    int rthreads = 256;
-    int rblocks = (mg.grid.numBlocks * 256 + rthreads - 1) / rthreads;
-
-    for(int i = 0; i < 15; i++) {
-        // Run one cycle
-        solver.runCycle(mg, 0);
-
-        // --- VERIFICATION STEP ---
-        // Compute r = b - Ax on Level 0
-        computeExplicitResidual<<<mg.grid.numBlocks, 256>>>(
-            mg.grid, // Passing the full MSBG struct now
-            solver.levels_c_off[0],
-            solver.levels_fx_off[0], solver.levels_beta_x[0],
-            solver.levels_fy_off[0], solver.levels_beta_y[0],
-            solver.levels_fz_off[0], solver.levels_beta_z[0],
-            solver.levels_x[0], // Current Pressure
-            solver.levels_b[0], // Divergence
-            d_r0,               // Output Residual
-            0                   // Level 0
-        );
-        cudaDeviceSynchronize();
-
-        // Compute L2 Norm: sqrt( sum( r[i]^2 ) )
-        thrust::device_ptr<float> dev_r(d_r0);
-        float sum_sq = thrust::transform_reduce(
-            thrust::device,
-            dev_r, dev_r + mg.grid.totalCells,
-            SquareOp(),
-            0.f,
-            thrust::plus<float>()
-        );
-
-        float l2_norm = std::sqrt(sum_sq);
-
-        printf("%5d | %e\n", i+1, l2_norm);
-    }
-
-    cudaFree(d_r0);
 
     cudaFree(d_cellCounts);
     cudaFree(d_fxCounts);
@@ -330,6 +333,7 @@ int main() {
 
     exportMultigrid_VTK(h_refinementMap.data(), dims, blockSize, "msbg.vtk");
     exportParticles_VTK(h_pos, h_rad, "particles.vtk");
+    exportUniformPressure_VTK(mg, make_int3(512, 512, 512), "pressure_field.vtk");
 
     return 0;
 }
