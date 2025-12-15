@@ -396,126 +396,105 @@ __device__ inline float getScalingFactor(uint32_t currentLevel, uint32_t neighbo
     return s;
 }
 
-__global__ void galerkinCoarsen(MSBG grid, const float* __restrict__ d_fineCoeffs, float* __restrict__ d_coarseCoeffs, int axis, uint32_t coarseLevel) {
+// --- CORRECTED GALERKIN KERNEL ---
+__global__ void galerkinCoarsen(
+    MSBG grid,
+    const float* __restrict__ d_fineCoeffs,
+    float* __restrict__ d_coarseCoeffs,
+    const uint32_t* __restrict__ fineOffsets,
+    const uint32_t* __restrict__ coarseOffsets,
+    int axis,
+    uint32_t destMGLevel
+) {
     uint32_t idx = blockIdx.x;
     if (idx >= grid.numBlocks) return;
 
     uint32_t nativeLevel = grid.d_refinementMap[idx];
 
-    if (nativeLevel >= coarseLevel)
-    {
-        if (nativeLevel == coarseLevel)
-        {
-            BlockLayout layout = c_blockLayouts[coarseLevel];
-            int res = layout.res;
+    // Calculate Dynamic Resolutions based on Block Level + MG Level
+    // Fine Res  = Base >> (native + dest - 1)
+    // Coarse Res = Base >> (native + dest)
+    int fineRes = BLOCK_BASE_RES >> (nativeLevel + destMGLevel - 1);
+    int coarseRes = BLOCK_BASE_RES >> (nativeLevel + destMGLevel);
 
-            int dimX = res + (axis == AXIS_X ? 1 : 0);
-            int dimY = res + (axis == AXIS_Y ? 1 : 0);
-            int dimZ = res + (axis == AXIS_Z ? 1 : 0);
+    // Skip if block vanishes at this coarse level
+    if (coarseRes < 1) return;
+    // Safety check: must have fine cells to average from
+    if (fineRes < 2) return;
 
-            int tx = threadIdx.x; int ty = threadIdx.y; int tz = threadIdx.z;
-            if (tx >= dimX || ty >= dimY || tz >= dimZ) return;
-
-            uint32_t offset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
-                            : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
-                            :                    grid.d_faceZOffsets[idx];
-
-            uint32_t faceIdx;
-            if (axis == AXIS_X) faceIdx = faceXIndex3D(tx, ty, tz, res);
-            else if (axis == AXIS_Y) faceIdx = faceYIndex3D(tx, ty, tz, res);
-            else faceIdx = faceZIndex3D(tx, ty, tz, res);
-
-            d_coarseCoeffs[offset + faceIdx] = d_fineCoeffs[offset + faceIdx];
-        }
-        return;
-    }
-
-    if (nativeLevel != (coarseLevel - 1)) return;
-
-    BlockLayout coarseLayout = c_blockLayouts[coarseLevel];
-    int coarseRes = coarseLayout.res;
-
-    BlockLayout fineLayout = c_blockLayouts[coarseLevel - 1];
-    int fineRes = fineLayout.res;
-
-    // One thread per face within block
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int tz = threadIdx.z;
-
+    // Linearized Dimensions for this block (Coarse)
     int dimX = coarseRes + (axis == AXIS_X ? 1 : 0);
     int dimY = coarseRes + (axis == AXIS_Y ? 1 : 0);
     int dimZ = coarseRes + (axis == AXIS_Z ? 1 : 0);
+    int totalElements = dimX * dimY * dimZ;
 
-    if (tx >= dimX || ty >= dimY || tz >= dimZ) return;
+    // Use linearized loop
+    for (int i = threadIdx.x; i < totalElements; i += blockDim.x) {
+        int tz = i / (dimX * dimY);
+        int rem = i % (dimX * dimY);
+        int ty = rem / dimX;
+        int tx = rem % dimX;
 
-    uint32_t neighborIdx = -1;
-    bool isBoundary = false;
-    int3 bCoord = grid.d_blockInfo[idx].coord;
+        // --- Boundary Scaling Logic ---
+        int3 bCoord = grid.d_blockInfo[idx].coord;
+        uint32_t neighborIdx = -1;
+        bool isBoundary = false;
 
-    if (axis == AXIS_X) {
-        if (tx == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, -1, 0, 0); isBoundary = true; }
-        if (tx == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 1, 0, 0); isBoundary = true; }
-    } else if (axis == AXIS_Y) {
-        if (ty == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, -1, 0); isBoundary = true; }
-        if (ty == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 1, 0); isBoundary = true; }
-    } else {
-        if (tz == 0) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 0, -1); isBoundary = true; }
-        if (tz == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord,grid.indexDims, 0, 0, -1); isBoundary = true; }
-    }
-
-    float s;
-    if (isBoundary) {
-        s = getScalingFactor(coarseLevel, neighborIdx, grid.d_refinementMap);
-    } else {
-        s = (float)(1 << coarseLevel);
-    }
-
-    float sum = 0.f;
-    uint32_t fineBlockOffset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
-                             : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
-                             :                    grid.d_faceZOffsets[idx];
-
-    const int fx_start = tx * 2;
-    const int fy_start = ty * 2;
-    const int fz_start = tz * 2;
-
-    for (int d1 = 0; d1 < 2; d1++) {
-        for (int d2 = 0; d2 < 2; d2++) {
-            int f_x = fx_start;
-            int f_y = fy_start;
-            int f_z = fz_start;
-
-            if (axis == AXIS_X) {
-                f_y += d1;
-                f_z += d2;
-            } else if (axis == AXIS_Y) {
-                f_x += d1;
-                f_z += d2;
-            } else {
-                f_x += d1;
-                f_y += d2;
-            }
-
-            uint32_t fineIdx;
-            if (axis == AXIS_X) fineIdx = faceXIndex3D(f_x, f_y, f_z, fineRes);
-            else if (axis == AXIS_Y) fineIdx = faceYIndex3D(f_x, f_y, f_z, fineRes);
-            else fineIdx = faceZIndex3D(f_x, f_y, f_z, fineRes);
-
-            sum += d_fineCoeffs[fineBlockOffset + fineIdx];
+        if (axis == AXIS_X) {
+            if (tx == 0) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, -1, 0, 0); isBoundary = true; }
+            else if (tx == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, 1, 0, 0); isBoundary = true; }
+        } else if (axis == AXIS_Y) {
+            if (ty == 0) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, 0, -1, 0); isBoundary = true; }
+            else if (ty == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, 0, 1, 0); isBoundary = true; }
+        } else {
+            if (tz == 0) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, 0, 0, -1); isBoundary = true; }
+            else if (tz == coarseRes) { neighborIdx = getNeighborBlockIdx(bCoord, grid.indexDims, 0, 0, 1); isBoundary = true; }
         }
+
+        // Correct Scaling:
+        // 1. Spatial scaling relative to Native Level (T-Junctions)
+        // 2. Hierarchical scaling (MG Level increases -> h increases -> beta increases)
+        float baseS = (isBoundary)
+            ? getScalingFactor(nativeLevel, neighborIdx, grid.d_refinementMap)
+            : (float)(1 << nativeLevel);
+
+        // Combine with Multigrid scaling factor (2^destLevel)
+        float s = baseS * (float)(1 << destMGLevel);
+
+        // --- Reduction Logic ---
+        float sum = 0.f;
+        uint32_t fineBlockOffset = fineOffsets[idx];
+
+        // Map Coarse Face (tx,ty,tz) to 4 Fine Faces
+        int fx_start = tx * 2;
+        int fy_start = ty * 2;
+        int fz_start = tz * 2;
+
+        for (int d1 = 0; d1 < 2; d1++) {
+            for (int d2 = 0; d2 < 2; d2++) {
+                int f_x = fx_start; int f_y = fy_start; int f_z = fz_start;
+                if (axis == AXIS_X) { f_y += d1; f_z += d2; }
+                else if (axis == AXIS_Y) { f_x += d1; f_z += d2; }
+                else { f_x += d1; f_y += d2; }
+
+                uint32_t fineIdx;
+                if (axis == AXIS_X) fineIdx = faceXIndex3D(f_x, f_y, f_z, fineRes);
+                else if (axis == AXIS_Y) fineIdx = faceYIndex3D(f_x, f_y, f_z, fineRes);
+                else fineIdx = faceZIndex3D(f_x, f_y, f_z, fineRes);
+
+                sum += d_fineCoeffs[fineBlockOffset + fineIdx];
+            }
+        }
+
+        // Write Result
+        uint32_t coarseBlockOffset = coarseOffsets[idx];
+        uint32_t coarseIdx;
+        if (axis == AXIS_X) coarseIdx = faceXIndex3D(tx, ty, tz, coarseRes);
+        else if (axis == AXIS_Y) coarseIdx = faceYIndex3D(tx, ty, tz, coarseRes);
+        else coarseIdx = faceZIndex3D(tx, ty, tz, coarseRes);
+
+        d_coarseCoeffs[coarseBlockOffset + coarseIdx] = s * (sum * 0.25f);
     }
-
-    uint32_t coarseBlockOffset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
-                                : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
-                                : grid.d_faceZOffsets[idx];
-
-    uint32_t coarseIdx;
-    if (axis == AXIS_X) coarseIdx = faceXIndex3D(tx, ty, tz, coarseRes);
-    else if (axis == AXIS_Y) coarseIdx = faceYIndex3D(tx, ty, tz, coarseRes);
-    else coarseIdx = faceZIndex3D(tx, ty, tz, coarseRes);
-
-    d_coarseCoeffs[coarseBlockOffset + coarseIdx] = s * (sum * 0.25f);
 }
 
 //// Grid Manager class
@@ -679,41 +658,78 @@ public:
         delete[] h_faceZData;
     }
 
-    void runGalerkin(const float* d_fineBetaX, const float* d_fineBetaY, const float* d_fineBetaZ,
-                     float* d_coarseBetaX, float* d_coarseBetaY, float* d_coarseBetaZ,
-                     const uint32_t targetCoarseLevel) const {
-        if (targetCoarseLevel == 0 || targetCoarseLevel >= MAX_LEVELS) return;
-
-        int dim = c_blockLayouts[targetCoarseLevel].res + 1;
-        dim3 threads(dim, dim, dim);
+    void runGalerkin(
+        const float* fineBx, const float* fineBy, const float* fineBz,
+        const uint32_t* fineOffX, const uint32_t* fineOffY, const uint32_t* fineOffZ,
+        float* coarseBx, float* coarseBy, float* coarseBz,
+        const uint32_t* coarseOffX, const uint32_t* coarseOffY, const uint32_t* coarseOffZ,
+        const uint32_t destLevel
+    ) const {
+        if (destLevel == 0 || destLevel >= MAX_LEVELS) return;
+        int threads = 256;
         dim3 blocks(this->grid.numBlocks);
 
-        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaX, d_coarseBetaX, AXIS_X, targetCoarseLevel);
-        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaY, d_coarseBetaY, AXIS_Y, targetCoarseLevel);
-        galerkinCoarsen<<<blocks, threads>>>(this->grid, d_fineBetaZ, d_coarseBetaZ, AXIS_Z, targetCoarseLevel);
-
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, fineBx, coarseBx, fineOffX, coarseOffX, AXIS_X, destLevel);
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, fineBy, coarseBy, fineOffY, coarseOffY, AXIS_Y, destLevel);
+        galerkinCoarsen<<<blocks, threads>>>(this->grid, fineBz, coarseBz, fineOffZ, coarseOffZ, AXIS_Z, destLevel);
         cudaDeviceSynchronize();
     }
 };
 
+void computeCoarseOffsets(MSBGManager& mg, int mgLevel, uint32_t* d_offsets_out, uint32_t& totalSize_out) {
+    std::vector<uint32_t> h_refinement(mg.grid.numBlocks);
+    cudaMemcpy(h_refinement.data(), mg.grid.d_refinementMap, mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    std::vector<uint32_t> h_counts(mg.grid.numBlocks);
 
-void computeCoarseOffsets(
-    MSBGManager& mg,
-    int mgLevel,
-    uint32_t* d_offsets_out,
-    uint32_t& totalSize_out
-    )
+    // CPU-side size logic (matches GPU but runs on Host)
+    for (size_t i = 0; i < mg.grid.numBlocks; i++) {
+        uint32_t msbgLevel = h_refinement[i];
+
+        // Manual calculation instead of reading c_blockLayouts[msbgLevel]
+        int currentRes = BLOCK_BASE_RES >> msbgLevel;
+
+        int res = currentRes >> mgLevel;
+        if (res < 1) res = 0;
+
+        h_counts[i] = res * res * res;
+    }
+
+    std::vector<uint32_t> h_offsets(mg.grid.numBlocks);
+    uint32_t total = 0;
+    for (size_t i = 0; i < mg.grid.numBlocks; i++) {
+        h_offsets[i] = total;
+        total += h_counts[i];
+    }
+    totalSize_out = total;
+    cudaMemcpy(d_offsets_out, h_offsets.data(), mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyHostToDevice);
+}
+
+void computeCoarseFaceOffsets(MSBGManager& mg, int mgLevel, int axis, uint32_t* d_offsets_out, uint32_t& totalSize_out)
 {
-    std::vector<uint32_t>  h_refinement(mg.grid.numBlocks);
+    std::vector<uint32_t> h_refinement(mg.grid.numBlocks);
     cudaMemcpy(h_refinement.data(), mg.grid.d_refinementMap, mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
     std::vector<uint32_t> h_counts(mg.grid.numBlocks);
+
     for (size_t i = 0; i < mg.grid.numBlocks; i++)
     {
         uint32_t msbgLevel = h_refinement[i];
-        int res = c_blockLayouts[msbgLevel].res >> mgLevel;
+
+        int currentRes = BLOCK_BASE_RES >> msbgLevel;
+
+        int res = currentRes >> mgLevel;
         if (res < 1) res = 0;
-        h_counts[i] = res * res * res;
+
+        if (res == 0)
+        {
+            h_counts[i] = 0;
+        } else
+        {
+            int nx = res + (axis == AXIS_X ? 1: 0);
+            int ny = res + (axis == AXIS_Y ? 1: 0);
+            int nz = res + (axis == AXIS_Z ? 1: 0);
+            h_counts[i] = nx * ny * nz;
+        }
     }
 
     std::vector<uint32_t> h_offsets(mg.grid.numBlocks);

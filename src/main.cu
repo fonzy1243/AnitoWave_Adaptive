@@ -4,7 +4,14 @@
 #include <thrust/device_ptr.h>
 #include <MSBG.cuh>
 #include <Smoother.cuh>
+#include <VCycle.cuh>
 #include <vtx_visualization.cuh>
+
+struct SquareOp {
+    __device__ float operator()(float x) const {
+        return x * x;
+    }
+};
 
 __global__ void countActiveBlocks(const uint32_t* map, uint32_t* out, uint32_t N) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -36,7 +43,7 @@ int main() {
     std::cout << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
 
     // Setup multigrid
-    int3 dims = make_int3(70, 70, 70);
+    int3 dims = make_int3(40, 40, 40);
     float blockSize = 1.0f;
     float3 domainMin = make_float3(0, 0, 0);
 
@@ -228,89 +235,90 @@ int main() {
 
     int numThreads = 256;
     int numBlocksInitX = (mg.grid.totalFacesX + numThreads - 1) / numThreads;
-    int numBlocksInitY = (mg.grid.totalFacesY + numThreads - 1) / numThreads;
-    int numBlocksInitZ = (mg.grid.totalFacesZ + numThreads - 1) / numThreads;
-
-    initArrayConst<<<numBlocksInitX, numThreads>>>(d_fineBetaX, 1.f, mg.grid.totalFacesX);
-    initArrayConst<<<numBlocksInitY, numThreads>>>(d_fineBetaY, 1.f, mg.grid.totalFacesY);
-    initArrayConst<<<numBlocksInitZ, numThreads>>>(d_fineBetaZ, 1.f, mg.grid.totalFacesZ);
-    cudaDeviceSynchronize();
-
-    std::cout << "Running Galerkin Coarsening Test (Level 0 -> 1)...\n";
-
-    mg.runGalerkin(d_fineBetaX, d_fineBetaY, d_fineBetaZ,
-        d_fineBetaX, d_fineBetaY, d_fineBetaZ, 1);
-
-    std::vector<float> h_betaX(mg.grid.totalFacesX);
-    cudaMemcpy(h_betaX.data(), d_fineBetaX, mg.grid.totalFacesX * sizeof(float), cudaMemcpyDeviceToHost);
-
-    std::vector<uint32_t> h_faceXOffsets(mg.grid.numBlocks);
-    cudaMemcpy(h_faceXOffsets.data(), mg.grid.d_faceXOffsets, mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-    int testCount = 0;
-
-    std::cout << "Verifying results...\n";
-
-    for (uint32_t i = 0; i < mg.grid.numBlocks; i++) {
-        if (h_refinementMap[i] == 0 && i % 500 == 0) {
-            uint32_t offset = h_faceXOffsets[i];
-            float val = h_betaX[offset];
-
-            std::cout << "Block " << i << " lvl 0: " << val << "\n";
-
-            testCount++;
-        }
-    }
-
-    std::cout << std::endl;
-
-    AdaptiveSmoother smoother(mg.grid.numBlocks);
+    initArrayConst<<<numBlocksInitX, numThreads>>>(h_faceXPtrs[BETA_COEFF_X], 1.f, mg.grid.totalFacesX);
+    initArrayConst<<<(mg.grid.totalFacesY + 255)/256, 256>>>(h_faceYPtrs[BETA_COEFF_Y], 1.f, mg.grid.totalFacesY);
+    initArrayConst<<<(mg.grid.totalFacesZ + 255)/256, 256>>>(h_faceZPtrs[BETA_COEFF_Z], 1.f, mg.grid.totalFacesZ);
 
     float* h_cellPtrs[NUM_CHANNELS];
     cudaMemcpy(h_cellPtrs, mg.grid.d_cellData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
-
-    float* d_pressure = h_cellPtrs[PRESSURE];
-    float* d_divergence = h_cellPtrs[DIVERGENCE];
-
-    initArrayConst<<<(mg.grid.totalCells + 255)/256, 256>>>(d_pressure, 0.f, mg.grid.totalCells);
-
-    initDivergence<<<(mg.grid.totalCells + 255)/256, 256>>>(d_divergence, mg.grid.totalCells);
+    initArrayConst<<<(mg.grid.totalCells + 255)/256, 256>>>(h_cellPtrs[PRESSURE], 0.f, mg.grid.totalCells);
+    initDivergence<<<(mg.grid.totalCells + 255)/256, 256>>>(h_cellPtrs[DIVERGENCE], mg.grid.totalCells);
     cudaDeviceSynchronize();
 
-    std::cout << "Initialized Pressure to 0 and Divergence to synthetic noise." << std::endl;
-    std::cout << "Running Adaptive Smoother (Algorithm 2)..." << std::endl;
+    // 2. Setup V-Cycle
+    std::cout << "Building V-Cycle Hierarchy..." << std::endl;
+    VCycleSolver solver(MAX_LEVELS, mg.grid.numBlocks);
+    solver.init(mg);
 
-    // Run for 20 global iterations with a threshold of 1e-4
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
+    // 3. Run
+    std::cout << "Running 10 V-Cycles..." << std::endl;
+    for(int i = 0; i < 10; i++) {
+        solver.runCycle(mg, 0);
+    }
+    cudaDeviceSynchronize();
 
-    cudaEventRecord(start);
-    smoother.solve(mg, 20, 1e-4f);
-    cudaEventRecord(stop);
+    // 4. Verify
+    thrust::device_ptr<float> dev_p(h_cellPtrs[PRESSURE]);
+    float max_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, -1e20f, thrust::maximum<float>());
+    float min_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, 1e20f, thrust::minimum<float>());
+    std::cout << "Pressure Range: [" << min_p << ", " << max_p << "]" << std::endl;
 
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    // ---------------------------------------------------------
+    // 3. Run Solver Loop with Residual Tracking
+    // ---------------------------------------------------------
 
-    std::cout << "Solver completed in " << milliseconds << " ms." << std::endl;
+    // Temporary buffer for computing residuals on Level 0
+    float* d_r0;
+    cudaMalloc(&d_r0, mg.grid.totalCells * sizeof(float));
 
-    thrust::device_ptr<float> dev_p(d_pressure);
-    try {
-        float max_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, -1e20, thrust::maximum<float>());
-        float min_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, 1e20, thrust::minimum<float>());
+    std::cout << "\nStarting V-Cycles (Target: Reduce Residual)...\n";
+    std::cout << "Cycle | Residual (L2 Norm)\n";
+    std::cout << "--------------------------\n";
 
-        std::cout << "Pressure Range: [" << min_p << ", " << max_p << "]" << std::endl;
-        if (max_p > 0.0f || min_p < 0.0f) {
-            std::cout << "SUCCESS: Pressure field evolved." << std::endl;
-        } else {
-            std::cout << "WARNING: Pressure field is still zero (Solver might not have converged)." << std::endl;
-        }
-    } catch (thrust::system_error &e) {
-        std::cerr << "Thrust error during verification: " << e.what() << std::endl;
+    // Initial Residual (Before solving, x=0, so r = b - A*0 = b)
+    // We strictly assume r=b, but let's compute it properly to be safe.
+    // Note: computeExplicitResidual is inside VCycle.cuh, but it's a __global__ kernel.
+    // We need to launch it manually here or expose a helper in VCycleSolver.
+    // For now, we will launch it using the pointers solver has cached.
+
+    int rthreads = 256;
+    int rblocks = (mg.grid.numBlocks * 256 + rthreads - 1) / rthreads;
+
+    for(int i = 0; i < 15; i++) {
+        // Run one cycle
+        solver.runCycle(mg, 0);
+
+        // --- VERIFICATION STEP ---
+        // Compute r = b - Ax on Level 0
+        computeExplicitResidual<<<mg.grid.numBlocks, 256>>>(
+            mg.grid, // Passing the full MSBG struct now
+            solver.levels_c_off[0],
+            solver.levels_fx_off[0], solver.levels_beta_x[0],
+            solver.levels_fy_off[0], solver.levels_beta_y[0],
+            solver.levels_fz_off[0], solver.levels_beta_z[0],
+            solver.levels_x[0], // Current Pressure
+            solver.levels_b[0], // Divergence
+            d_r0,               // Output Residual
+            0                   // Level 0
+        );
+        cudaDeviceSynchronize();
+
+        // Compute L2 Norm: sqrt( sum( r[i]^2 ) )
+        thrust::device_ptr<float> dev_r(d_r0);
+        float sum_sq = thrust::transform_reduce(
+            thrust::device,
+            dev_r, dev_r + mg.grid.totalCells,
+            SquareOp(),
+            0.f,
+            thrust::plus<float>()
+        );
+
+        float l2_norm = std::sqrt(sum_sq);
+
+        printf("%5d | %e\n", i+1, l2_norm);
     }
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    cudaFree(d_r0);
 
     cudaFree(d_cellCounts);
     cudaFree(d_fxCounts);
