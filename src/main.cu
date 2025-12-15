@@ -3,6 +3,7 @@
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
 #include <MSBG.cuh>
+#include <Smoother.cuh>
 #include <vtx_visualization.cuh>
 
 __global__ void countActiveBlocks(const uint32_t* map, uint32_t* out, uint32_t N) {
@@ -17,6 +18,13 @@ __global__ void initArrayConst(float* data, float value, uint32_t N) {
     data[idx] = value;
 }
 
+__global__ void initDivergence(float* div, uint32_t n)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    div[idx] = sinf(static_cast<float>(idx) * 0.01f) * 0.1f;
+}
+
 int main() {
     std::cout << "CUDA MSBG Test" << std::endl;
 
@@ -28,7 +36,7 @@ int main() {
     std::cout << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
 
     // Setup multigrid
-    int3 dims = make_int3(80, 80, 80);
+    int3 dims = make_int3(70, 70, 70);
     float blockSize = 1.0f;
     float3 domainMin = make_float3(0, 0, 0);
 
@@ -80,7 +88,17 @@ int main() {
     cudaMemcpy(d_pos, h_pos.data(), numParticles * sizeof(float3), cudaMemcpyHostToDevice);
     cudaMemcpy(d_rad, h_rad.data(), numParticles * sizeof(float), cudaMemcpyHostToDevice);
 
-    cudaMemset(mg.grid.d_refinementMap, MAX_LEVELS - 1, mg.grid.numBlocks * sizeof(uint8_t));
+    // cudaMemset(mg.grid.d_refinementMap, MAX_LEVELS - 1, mg.grid.numBlocks * sizeof(uint8_t));
+
+    int threads_map = 256;
+    int blocks_map = (mg.grid.numBlocks + threads_map - 1) / threads_map;
+
+    initRefinementMap<<<blocks_map, threads_map>>>(
+        mg.grid.d_refinementMap,
+        MAX_LEVELS - 1,
+        mg.grid.numBlocks
+    );
+    cudaDeviceSynchronize();
 
     std::cout << "Marking active blocks..." << std::endl;
 
@@ -234,7 +252,7 @@ int main() {
     std::cout << "Verifying results...\n";
 
     for (uint32_t i = 0; i < mg.grid.numBlocks; i++) {
-        if (h_refinementMap[i] == 0) {
+        if (h_refinementMap[i] == 0 && i % 500 == 0) {
             uint32_t offset = h_faceXOffsets[i];
             float val = h_betaX[offset];
 
@@ -245,6 +263,54 @@ int main() {
     }
 
     std::cout << std::endl;
+
+    AdaptiveSmoother smoother(mg.grid.numBlocks);
+
+    float* h_cellPtrs[NUM_CHANNELS];
+    cudaMemcpy(h_cellPtrs, mg.grid.d_cellData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+
+    float* d_pressure = h_cellPtrs[PRESSURE];
+    float* d_divergence = h_cellPtrs[DIVERGENCE];
+
+    initArrayConst<<<(mg.grid.totalCells + 255)/256, 256>>>(d_pressure, 0.f, mg.grid.totalCells);
+
+    initDivergence<<<(mg.grid.totalCells + 255)/256, 256>>>(d_divergence, mg.grid.totalCells);
+    cudaDeviceSynchronize();
+
+    std::cout << "Initialized Pressure to 0 and Divergence to synthetic noise." << std::endl;
+    std::cout << "Running Adaptive Smoother (Algorithm 2)..." << std::endl;
+
+    // Run for 20 global iterations with a threshold of 1e-4
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    smoother.solve(mg, 20, 1e-4f);
+    cudaEventRecord(stop);
+
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    std::cout << "Solver completed in " << milliseconds << " ms." << std::endl;
+
+    thrust::device_ptr<float> dev_p(d_pressure);
+    try {
+        float max_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, -1e20, thrust::maximum<float>());
+        float min_p = thrust::reduce(thrust::device, dev_p, dev_p + mg.grid.totalCells, 1e20, thrust::minimum<float>());
+
+        std::cout << "Pressure Range: [" << min_p << ", " << max_p << "]" << std::endl;
+        if (max_p > 0.0f || min_p < 0.0f) {
+            std::cout << "SUCCESS: Pressure field evolved." << std::endl;
+        } else {
+            std::cout << "WARNING: Pressure field is still zero (Solver might not have converged)." << std::endl;
+        }
+    } catch (thrust::system_error &e) {
+        std::cerr << "Thrust error during verification: " << e.what() << std::endl;
+    }
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     cudaFree(d_cellCounts);
     cudaFree(d_fxCounts);

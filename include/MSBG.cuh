@@ -107,6 +107,7 @@ struct MSBG {
 
 //// Utils
 
+
 // Compute block layout for a given level
 __host__ inline BlockLayout computeBlockLayout(uint8_t level) {
     BlockLayout layout{};
@@ -127,6 +128,10 @@ __host__ void initializeBlockLayouts() {
     BlockLayout layouts[MAX_LEVELS];
     for (int i = 0; i < MAX_LEVELS; i++) {
         layouts[i] = computeBlockLayout(i);
+    }
+    cudaError_t err = cudaMemcpyToSymbol(c_blockLayouts, layouts, MAX_LEVELS * sizeof(BlockLayout));
+    if (err != cudaSuccess) {
+        printf("Error in initializeBlockLayouts: %s\n", cudaGetErrorString(err));
     }
     cudaMemcpyToSymbol(c_blockLayouts, layouts, MAX_LEVELS * sizeof(BlockLayout));
 }
@@ -241,6 +246,13 @@ __device__ inline float& accessFaceZ(
 
 //// Block management
 
+__global__ void initRefinementMap(uint32_t* map, uint32_t value, uint32_t N)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    map[idx] = value;
+}
+
 __global__ void initBlockInfo(BlockInfo* info, int3 dims) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t numBlocks = dims.x * dims.y * dims.z;
@@ -305,9 +317,9 @@ __global__ void enforceGrading(
     uint32_t* refinementMap,
     int3 dims
 ) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int z = blockIdx.z * blockDim.z + threadIdx.z;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
 
     if (x >= dims.x || y >= dims.y || z >= dims.z) return;
 
@@ -346,18 +358,16 @@ __global__ void countBlockElements(
     uint32_t* faceZCounts,
     uint32_t numBlocks
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numBlocks) return;
 
-    uint32_t level = refinementMap[idx];
-
-    if (level == MAX_LEVELS) {
+    if (uint32_t level = refinementMap[idx]; level == MAX_LEVELS) {
         cellCounts[idx] = 0;
         faceXCounts[idx] = 0;
         faceYCounts[idx] = 0;
         faceZCounts[idx] = 0;
     } else {
-        BlockLayout layout = c_blockLayouts[level];
+        const BlockLayout layout = c_blockLayouts[level];
         cellCounts[idx] = layout.numCells;
         faceXCounts[idx] = layout.numFacesX;
         faceYCounts[idx] = layout.numFacesY;
@@ -374,7 +384,7 @@ __device__ inline float getScalingFactor(uint32_t currentLevel, uint32_t neighbo
     // case 1: s <- 2^l * sigma_CF
     // case -1: s <- 2^l * sigma_FC
 
-    float s = (float)(1 << currentLevel);
+    auto s = (float)(1 << currentLevel);
 
     switch (levelDiff) {
         case 0: break;
@@ -386,11 +396,39 @@ __device__ inline float getScalingFactor(uint32_t currentLevel, uint32_t neighbo
     return s;
 }
 
-__global__ void galerkinCoarsen(MSBG grid, const float* d_fineCoeffs, float* d_coarseCoeffs, int axis, uint32_t coarseLevel) {
+__global__ void galerkinCoarsen(MSBG grid, const float* __restrict__ d_fineCoeffs, float* __restrict__ d_coarseCoeffs, int axis, uint32_t coarseLevel) {
     uint32_t idx = blockIdx.x;
     if (idx >= grid.numBlocks) return;
 
     uint32_t nativeLevel = grid.d_refinementMap[idx];
+
+    if (nativeLevel >= coarseLevel)
+    {
+        if (nativeLevel == coarseLevel)
+        {
+            BlockLayout layout = c_blockLayouts[coarseLevel];
+            int res = layout.res;
+
+            int dimX = res + (axis == AXIS_X ? 1 : 0);
+            int dimY = res + (axis == AXIS_Y ? 1 : 0);
+            int dimZ = res + (axis == AXIS_Z ? 1 : 0);
+
+            int tx = threadIdx.x; int ty = threadIdx.y; int tz = threadIdx.z;
+            if (tx >= dimX || ty >= dimY || tz >= dimZ) return;
+
+            uint32_t offset = (axis == AXIS_X) ? grid.d_faceXOffsets[idx]
+                            : (axis == AXIS_Y) ? grid.d_faceYOffsets[idx]
+                            :                    grid.d_faceZOffsets[idx];
+
+            uint32_t faceIdx;
+            if (axis == AXIS_X) faceIdx = faceXIndex3D(tx, ty, tz, res);
+            else if (axis == AXIS_Y) faceIdx = faceYIndex3D(tx, ty, tz, res);
+            else faceIdx = faceZIndex3D(tx, ty, tz, res);
+
+            d_coarseCoeffs[offset + faceIdx] = d_fineCoeffs[offset + faceIdx];
+        }
+        return;
+    }
 
     if (nativeLevel != (coarseLevel - 1)) return;
 
@@ -504,8 +542,6 @@ public:
         cudaDeviceSynchronize();
 
         cudaMalloc(&grid.d_cellOffsets, grid.numBlocks * sizeof(uint32_t));
-
-        cudaMalloc(&grid.d_cellOffsets, grid.numBlocks * sizeof(uint32_t));
         cudaMalloc(&grid.d_faceXOffsets, grid.numBlocks * sizeof(uint32_t));
         cudaMalloc(&grid.d_faceYOffsets, grid.numBlocks * sizeof(uint32_t));
         cudaMalloc(&grid.d_faceZOffsets, grid.numBlocks * sizeof(uint32_t));
@@ -538,40 +574,46 @@ public:
         if (grid.d_faceYOffsets) cudaFree(grid.d_faceYOffsets);
         if (grid.d_faceZOffsets) cudaFree(grid.d_faceZOffsets);
 
-        float* h_temp[NUM_CHANNELS];
+        float* h_temp[NUM_CHANNELS] = {};
 
         // free data channels
         if (grid.d_cellData) {
-            cudaMemcpy(h_temp, grid.d_cellData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
-            for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (h_temp[i]) cudaFree(h_temp[i]);
+            cudaMemcpy(h_temp, grid.d_cellData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+            for (auto & i : h_temp) {
+                if (i) cudaFree(i); i = nullptr;
             }
             cudaFree(grid.d_cellData);
             grid.d_cellData = nullptr;
         }
 
+        memset(h_temp, 0, NUM_CHANNELS * sizeof(float*));
         if (grid.d_faceXData) {
-            cudaMemcpy(h_temp, grid.d_faceXData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
-            for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (h_temp[i]) cudaFree(h_temp[i]);
+            cudaMemcpy(h_temp, grid.d_faceXData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+            for (auto & i : h_temp) {
+                if (i) cudaFree(i);
             }
             cudaFree(grid.d_faceXData);
+            grid.d_faceXData = nullptr;
         }
 
+        memset(h_temp, 0, NUM_CHANNELS * sizeof(float*));
         if (grid.d_faceYData) {
-            cudaMemcpy(h_temp, grid.d_faceYData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
-            for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (h_temp[i]) cudaFree(h_temp[i]);
+            cudaMemcpy(h_temp, grid.d_faceYData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+            for (auto & i : h_temp) {
+                if (i) cudaFree(i);
             }
             cudaFree(grid.d_faceYData);
+            grid.d_faceYData = nullptr;
         }
 
+        memset(h_temp, 0, NUM_CHANNELS * sizeof(float*));
         if (grid.d_faceZData) {
-            cudaMemcpy(h_temp, grid.d_faceZData, NUM_CHANNELS * sizeof(float), cudaMemcpyDeviceToHost);
-            for (int i = 0; i < NUM_CHANNELS; i++) {
-                if (h_temp[i]) cudaFree(h_temp[i]);
+            cudaMemcpy(h_temp, grid.d_faceZData, NUM_CHANNELS * sizeof(float*), cudaMemcpyDeviceToHost);
+            for (auto & i : h_temp) {
+                if (i) cudaFree(i);
             }
             cudaFree(grid.d_faceZData);
+            grid.d_faceZData = nullptr;
         }
     }
 
@@ -637,9 +679,9 @@ public:
         delete[] h_faceZData;
     }
 
-    void runGalerkin(float* d_fineBetaX, float* d_fineBetaY, float* d_fineBetaZ,
+    void runGalerkin(const float* d_fineBetaX, const float* d_fineBetaY, const float* d_fineBetaZ,
                      float* d_coarseBetaX, float* d_coarseBetaY, float* d_coarseBetaZ,
-                     uint32_t targetCoarseLevel) {
+                     const uint32_t targetCoarseLevel) const {
         if (targetCoarseLevel == 0 || targetCoarseLevel >= MAX_LEVELS) return;
 
         int dim = c_blockLayouts[targetCoarseLevel].res + 1;
@@ -653,4 +695,36 @@ public:
         cudaDeviceSynchronize();
     }
 };
+
+
+void computeCoarseOffsets(
+    MSBGManager& mg,
+    int mgLevel,
+    uint32_t* d_offsets_out,
+    uint32_t& totalSize_out
+    )
+{
+    std::vector<uint32_t>  h_refinement(mg.grid.numBlocks);
+    cudaMemcpy(h_refinement.data(), mg.grid.d_refinementMap, mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    std::vector<uint32_t> h_counts(mg.grid.numBlocks);
+    for (size_t i = 0; i < mg.grid.numBlocks; i++)
+    {
+        uint32_t msbgLevel = h_refinement[i];
+        int res = c_blockLayouts[msbgLevel].res >> mgLevel;
+        if (res < 1) res = 0;
+        h_counts[i] = res * res * res;
+    }
+
+    std::vector<uint32_t> h_offsets(mg.grid.numBlocks);
+    uint32_t total = 0;
+    for (size_t i = 0; i < mg.grid.numBlocks; i++)
+    {
+        h_offsets[i] = total;
+        total += h_counts[i];
+    }
+    totalSize_out = total;
+
+    cudaMemcpy(d_offsets_out, h_offsets.data(), mg.grid.numBlocks * sizeof(uint32_t), cudaMemcpyHostToDevice);
+}
 #endif //ANITOWAVE_ADAPTIVE_MULTIGRID_CUH
